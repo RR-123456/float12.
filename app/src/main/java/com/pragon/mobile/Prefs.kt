@@ -1,0 +1,210 @@
+package com.pragon.mobile
+
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+
+/** Pragon's three personalities. MASTER is the default: it talks AND acts, and says what it did. */
+enum class PMode(val key: String, val label: String) {
+    ASSISTANT("assistant", "ASSISTANT"),   // only talks and holds a conversation
+    MASTER("master", "MASTER"),            // assistant + agent: acts, and narrates what it did
+    AGENT("agent", "AGENT");               // acts, with as little talk as possible
+
+    companion object {
+        fun from(s: String?): PMode = values().firstOrNull { it.key == s } ?: MASTER
+    }
+}
+
+/** Saved PC address + the token the PC gave us when we paired, plus all the standalone settings. */
+object Prefs {
+    private fun sp(c: Context) = c.getSharedPreferences("pragon", Context.MODE_PRIVATE)
+    fun host(c: Context): String = sp(c).getString("host", "") ?: ""
+    fun port(c: Context): Int = sp(c).getInt("port", 8000)
+    fun token(c: Context): String = sp(c).getString("token", "") ?: ""
+    fun save(c: Context, host: String, port: Int, token: String) =
+        sp(c).edit().putString("host", host).putInt("port", port).putString("token", token).apply()
+    fun saveToken(c: Context, token: String) = sp(c).edit().putString("token", token).apply()
+
+    // ---- Standalone AI: the user's own Gemini key wins; otherwise the key cached from the paired PC.
+    fun aiKey(c: Context): String = sp(c).getString("ai_key", "") ?: ""
+    fun pcAiKey(c: Context): String = sp(c).getString("pc_ai_key", "") ?: ""
+
+    const val DEFAULT_GEMINI = "gemini-3.8-flash"
+
+    /** Models that no longer exist / are being shut down. If one of these is saved we quietly use the default. */
+    private val DEAD_MODELS = setOf(
+        "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro",
+        "gemini-2.0-flash", "gemini-2.0-flash-001", "gemini-2.0-flash-lite", "gemini-2.0-flash-lite-001",
+        "gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.5-flash-8b", "gemini-pro",
+    )
+
+    fun aiModel(c: Context): String {
+        val m = (sp(c).getString("ai_model", "") ?: "").trim()
+        return if (m.isBlank() || m in DEAD_MODELS) DEFAULT_GEMINI else m
+    }
+    /** The model that last answered successfully (set when the saved one 404s and a fallback works). */
+    fun aiModelWorking(c: Context): String = sp(c).getString("ai_model_ok", "") ?: ""
+    fun saveAiModelWorking(c: Context, m: String) = sp(c).edit().putString("ai_model_ok", m).apply()
+
+    fun effectiveAiKey(c: Context): String = aiKey(c).ifBlank { pcAiKey(c) }
+    fun saveAi(c: Context, key: String, model: String) =
+        sp(c).edit().putString("ai_key", key).putString("ai_model", model).remove("ai_model_ok").apply()
+    fun savePcAiKey(c: Context, key: String) = sp(c).edit().putString("pc_ai_key", key).apply()
+
+    // ---- AI engine for Standalone: "gemini" (online), "ollama" (offline / LAN) or "openai" (any OpenAI-compatible server)
+    fun engine(c: Context): String {
+        if (Offline.locked(c)) return "local"          // the always-offline lock means the on-device engine
+        val e = sp(c).getString("engine", "gemini") ?: "gemini"
+        val chosen = if (e == "ollama" || e == "openai") e else "gemini"
+        if (!Net.online(c)) {
+            // v11: no internet. A server on the home network (PC / Ghost) still works; Gemini does not.
+            val u = if (chosen == "ollama") ollamaHost(c) else if (chosen == "openai") openaiBase(c) else ""
+            val h = try { android.net.Uri.parse(if (u.contains("://")) u else "http://$u").host ?: "" } catch (x: Exception) { "" }
+            return if (h.isNotEmpty() && (Offline.isPrivate(h) || Offline.isLoopback(h))) chosen else "local"
+        }
+        return chosen
+    }
+    fun ollamaHost(c: Context): String {
+        val h = sp(c).getString("ollama_host", "") ?: ""
+        if (h.isNotBlank()) return h
+        val pc = host(c)
+        return if (pc.isNotBlank()) "http://$pc:11434" else "http://127.0.0.1:11434"
+    }
+    fun ollamaModel(c: Context): String {
+        val m = sp(c).getString("ollama_model", "") ?: ""
+        return if (m.isBlank()) "hermes3" else m
+    }
+    fun openaiBase(c: Context): String {
+        val b = sp(c).getString("openai_base", "") ?: ""
+        return if (b.isBlank()) "http://127.0.0.1:8080/v1" else b
+    }
+    fun openaiKey(c: Context): String = sp(c).getString("openai_key", "") ?: ""
+    fun openaiModel(c: Context): String = sp(c).getString("openai_model", "") ?: ""
+    fun saveEngine(c: Context, engine: String, oHost: String, oModel: String, base: String, key: String?, cModel: String) {
+        val e = sp(c).edit()
+            .putString("engine", engine)
+            .putString("ollama_host", oHost)
+            .putString("ollama_model", oModel)
+            .putString("openai_base", base)
+            .putString("openai_model", cModel)
+        if (key != null) e.putString("openai_key", key)   // null = keep the saved key
+        e.apply()
+    }
+    /** Short label for the chip in the Standalone header. */
+    fun engineLabel(c: Context): String = when (engine(c)) {
+        "ollama" -> "GHOST"
+        "openai" -> "CUSTOM"
+        "local" -> "LOCAL"
+        else -> "PRAGON"
+    }
+
+    // ---- Mode: assistant (talk only) / master (talk + act + narrate, DEFAULT) / agent (act)
+    fun mode(c: Context): PMode = PMode.from(sp(c).getString("mode", PMode.MASTER.key))
+    fun saveMode(c: Context, m: PMode) = sp(c).edit().putString("mode", m.key).apply()
+
+    // ---- Voice + personality (ported from the PC's Pragon protocol / voice settings)
+    /** What to call the user. The PC protocol says "sir". */
+    fun callMe(c: Context): String = (sp(c).getString("call_me", "sir") ?: "sir").trim().ifBlank { "sir" }
+    /** BCP-47 tag for listening and (for Latin-script replies) speaking. "" = the phone's language. */
+    fun speechLang(c: Context): String = sp(c).getString("speech_lang", "") ?: ""
+    /** "" = reply in whatever language the user is using right now; otherwise lock to this language name, e.g. "Tamil". */
+    fun replyLang(c: Context): String = sp(c).getString("reply_lang", "") ?: ""
+    fun ttsRate(c: Context): Float = sp(c).getFloat("tts_rate", 1.0f)
+    fun ttsPitch(c: Context): Float = sp(c).getFloat("tts_pitch", 0.95f)
+    fun ttsVoice(c: Context): String = sp(c).getString("tts_voice", "") ?: ""
+    /** Also speak replies to typed messages (voice messages are always spoken unless muted). */
+    fun speakTyped(c: Context): Boolean = sp(c).getBoolean("speak_typed", false)
+    /** Float mode: require the word "Pragon" before a free-form question (off = just talk). */
+    fun floatNeedsWake(c: Context): Boolean = sp(c).getBoolean("float_needs_wake", false)
+    fun setTtsVoice(c: Context, name: String) = sp(c).edit().putString("tts_voice", name).apply()
+
+    // ---- Pragon Live: the PC's Gemini native-audio session, on the phone (see LiveSession.kt)
+    /** ON by default. Used by float mode whenever the engine is Gemini, a key is set and Privacy Shield allows Google. */
+    fun liveOn(c: Context): Boolean = sp(c).getBoolean("live_on", true)
+    fun setLiveOn(c: Context, on: Boolean) = sp(c).edit().putBoolean("live_on", on).apply()
+    /** Same model the PC build uses (LIVE_MODEL in pragon_main.py). Override with the "live_model" pref if Google retires it. */
+    const val LIVE_MODEL_DEFAULT = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+    fun liveModel(c: Context): String = (sp(c).getString("live_model", "") ?: "").trim().ifBlank { LIVE_MODEL_DEFAULT }
+    /** The PC speaks in Charon. */
+    fun liveVoice(c: Context): String = (sp(c).getString("live_voice", "") ?: "").trim().ifBlank { "Charon" }
+    fun setLiveVoice(c: Context, v: String) = sp(c).edit().putString("live_voice", v).apply()
+    /** Keep the microphone open while Pragon talks, so you can interrupt it. Turn off if it hears itself (no headphones). */
+    fun liveBargeIn(c: Context): Boolean = sp(c).getBoolean("live_barge_in", true)
+    fun setLiveBargeIn(c: Context, on: Boolean) = sp(c).edit().putBoolean("live_barge_in", on).apply()
+    /** v10: affective dialog + proactive audio make Live decide whether to answer "hi" (slow). Off by default. */
+    fun liveEnhanced(c: Context): Boolean = sp(c).getBoolean("live_enhanced", false)
+    fun setLiveEnhanced(c: Context, on: Boolean) = sp(c).edit().putBoolean("live_enhanced", on).apply()
+
+    // ---- v10 strict offline mode (see Offline.kt)
+    /** ON by default in v10: no Gemini Live, no cloud AI, only loopback network. Turn off in Settings to get the v9 online features back. */
+    // v11: Pragon follows the connection by itself. This switch is only the manual LOCK: ON = always offline, even with internet.
+    // New key + default OFF, so a v10 install that never touched the switch doesn't stay offline forever.
+    fun offlineOnly(c: Context): Boolean = sp(c).getBoolean("offline_lock", false)
+    fun setOfflineOnly(c: Context, on: Boolean) = sp(c).edit().putBoolean("offline_lock", on).apply()
+    /** Settings > Features: show every feature even when the current connection can't run it. */
+    fun showAllFeatures(c: Context): Boolean = sp(c).getBoolean("show_all_features", false)
+    fun setShowAllFeatures(c: Context, on: Boolean) = sp(c).edit().putBoolean("show_all_features", on).apply()
+
+    // ---- v11: Pragon contacts ON/OFF, speech engine, parallel LLMs
+    /** OFF = Pragon's own contact list is ignored: "call Ravi" uses the phone's contacts. */
+    fun contactsOn(c: Context): Boolean = sp(c).getBoolean("pc_enabled", true)
+    fun setContactsOn(c: Context, on: Boolean) = sp(c).edit().putBoolean("pc_enabled", on).apply()
+    /** "auto" (Vosk offline / when Android has no recognizer, Android's online), "vosk" or "android". */
+    fun sttEngine(c: Context): String = (sp(c).getString("stt_engine", "auto") ?: "auto").let { if (it == "vosk" || it == "android") it else "auto" }
+    fun setSttEngine(c: Context, e: String) = sp(c).edit().putString("stt_engine", e).apply()
+    /** Zip of a Vosk model. Default: small English. Change it (a Vosk model URL) for another language. */
+    fun sttModelUrl(c: Context): String =
+        (sp(c).getString("stt_model_url", "") ?: "").trim().let { if (it.contains("alphacephei")) "" else it }.ifBlank { SherpaStt.DEFAULT_MODEL_URL }   // v12: an old Vosk link is ignored
+
+    /** v12: run the chat model on the phone's GPU (CPU stays free for speech and the router). Off by default; falls back to CPU if the GPU can't start. */
+    fun chatGpu(c: Context): Boolean = sp(c).getBoolean("chat_gpu", false)
+    fun setChatGpu(c: Context, on: Boolean) = sp(c).edit().putBoolean("chat_gpu", on).apply()
+    fun setSttModelUrl(c: Context, u: String) = sp(c).edit().putString("stt_model_url", u.trim()).apply()
+    /** Run the router and chat models together when the phone has the memory for it. */
+    fun parallelLlm(c: Context): Boolean = sp(c).getBoolean("parallel_llm", true)
+    fun setParallelLlm(c: Context, on: Boolean) = sp(c).edit().putBoolean("parallel_llm", on).apply()
+    fun modelUrl(c: Context): String = (sp(c).getString("model_url", "") ?: "").trim().ifBlank { Offline.DEFAULT_MODEL_URL }
+    fun setModelUrl(c: Context, u: String) = sp(c).edit().putString("model_url", u.trim()).apply()
+    /** Send button is tapped for you after a message is typed (needs the accessibility service). */
+    fun autoSend(c: Context): Boolean = sp(c).getBoolean("auto_send", true)
+    fun setAutoSend(c: Context, on: Boolean) = sp(c).edit().putBoolean("auto_send", on).apply()
+    fun setTtsPitch(c: Context, p: Float) = sp(c).edit().putFloat("tts_pitch", p.coerceIn(0.5f, 1.5f)).apply()
+    fun muted(c: Context): Boolean = sp(c).getBoolean("muted", false)
+    fun setMuted(c: Context, v: Boolean) = sp(c).edit().putBoolean("muted", v).apply()
+    fun saveVoice(
+        c: Context, callMe: String, speechLang: String, replyLang: String, rate: Float, pitch: Float,
+        voice: String, speakTyped: Boolean, floatNeedsWake: Boolean,
+    ) {
+        sp(c).edit()
+            .putString("call_me", callMe.trim().ifBlank { "sir" })
+            .putString("speech_lang", speechLang.trim())
+            .putString("reply_lang", replyLang.trim())
+            .putFloat("tts_rate", rate.coerceIn(0.5f, 2.0f))
+            .putFloat("tts_pitch", pitch.coerceIn(0.5f, 1.5f))
+            .putString("tts_voice", voice.trim())
+            .putBoolean("speak_typed", speakTyped)
+            .putBoolean("float_needs_wake", floatNeedsWake)
+            .apply()
+    }
+
+    // ---- Float mode bubble position
+    fun floatX(c: Context, def: Int): Int = sp(c).getInt("float_x", def)
+    fun floatY(c: Context, def: Int): Int = sp(c).getInt("float_y", def)
+    fun saveFloatPos(c: Context, x: Int, y: Int) = sp(c).edit().putInt("float_x", x).putInt("float_y", y).apply()
+
+    /** Forget the PC but keep everything else (AI settings, mode, voice, memory, bubble position). */
+    fun clear(c: Context) {
+        sp(c).edit().remove("host").remove("port").remove("token").remove("pc_ai_key").apply()
+    }
+}
+
+/** Tiny bridge so the service can show its status in the activity. */
+object Bridge {
+    @Volatile var status: String = "Not connected"
+    @Volatile var listener: ((String) -> Unit)? = null
+    private val main = Handler(Looper.getMainLooper())
+    fun set(s: String) {
+        status = s
+        main.post { listener?.invoke(s) }
+    }
+}
