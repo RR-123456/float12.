@@ -57,6 +57,8 @@ object SherpaStt {
     private const val MAX_PHRASE_MS = 20_000L
     private const val PREROLL_CHUNKS = 8                  // 8 x 50 ms = 400 ms kept for the VAD gate
     private const val ASR_THREADS = 2
+    /** v12.2: an "endpoint" with less text than this is a click or breath, not a command ("T"): ignore it and keep listening. */
+    private const val MIN_TEXT_CHARS = 3
     /** v12.1: the VAD gate (skip the recognizer while nobody speaks) is OFF until it is proven not to clip the first word. */
     private const val USE_VAD_GATE = false
     /** Trailing silence that ends a phrase. Short enough to feel instant, long enough not to cut "set a timer ... for ten minutes". */
@@ -270,9 +272,10 @@ object SherpaStt {
                         post { l.onPartialResults(bundle(listOf(text))) }
                     }
                     if (r0.isEndpoint(st)) {
-                        if (text.isEmpty()) {                  // silence "endpoint": start over, keep listening
+                        if (text.length < MIN_TEXT_CHARS) {    // silence or a stray click/breath: start over, keep listening
                             r0.reset(st)
                             lastPartial = ""
+                            spoke = false
                             if (v != null) { inUtterance = false; v.reset() }
                             continue
                         }
