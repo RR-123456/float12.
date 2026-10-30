@@ -57,6 +57,8 @@ object SherpaStt {
     private const val MAX_PHRASE_MS = 20_000L
     private const val PREROLL_CHUNKS = 8                  // 8 x 50 ms = 400 ms kept for the VAD gate
     private const val ASR_THREADS = 2
+    /** v12.1: the VAD gate (skip the recognizer while nobody speaks) is OFF until it is proven not to clip the first word. */
+    private const val USE_VAD_GATE = false
     /** Trailing silence that ends a phrase. Short enough to feel instant, long enough not to cut "set a timer ... for ten minutes". */
     private const val END_SILENCE_S = 0.7f
 
@@ -169,7 +171,7 @@ object SherpaStt {
     }
 
     private fun makeVad(c: Context): Vad? {
-        if (!hasVad(c)) return null
+        if (!USE_VAD_GATE || !hasVad(c)) return null
         return try {
             Vad(
                 assetManager = null,
