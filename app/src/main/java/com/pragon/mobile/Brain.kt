@@ -153,7 +153,9 @@ object Brain {
                 "I couldn't turn that into a phone action, $call. Try saying it a little differently."
             else
                 "I'm running fully offline, $call, and I have no chat model installed, so I only do phone commands. Say what can you do for the list."
-            return Reply(msg, true, false)
+            // v12.1: say what the recognizer actually heard, so a wrong transcript is obvious instead of a mystery
+            val heard = raw.trim().take(80)
+            return Reply(if (heard.isEmpty()) msg else "$msg I heard: \"$heard\".", true, false)
         }
         val text = Metrics.time("chat") { OnDeviceLlm.chat(ctx, raw, if (mode == PMode.AGENT) 128 else if (sink != null) 200 else 400) }
             ?: return Reply("My offline chat model didn't answer, $call. ${OnDeviceLlm.chatState}", true, false)
